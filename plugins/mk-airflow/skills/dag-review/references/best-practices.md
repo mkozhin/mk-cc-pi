@@ -263,7 +263,86 @@ def sales_etl():
 
 ---
 
-## 11. Мониторинг и алерты
+## 11. Sensor modes и deferrable operators
+
+**Проблема:** по умолчанию `mode='poke'` держит worker-слот занятым весь период ожидания — сенсор буквально блокирует воркер, пока не дождётся условия.
+
+**Приоритет решений (от худшего к лучшему):**
+```python
+# ХУДШИЙ: mode='poke' (по умолчанию) на долгое ожидание
+S3KeySensor(
+    task_id="wait_for_file",
+    bucket_key="data/{{ ds }}/input.csv",
+    poke_interval=300,
+    timeout=7200,
+    # mode не указан → poke → воркер занят все 2 часа
+)
+
+# ЛУЧШЕ: mode='reschedule' — освобождает воркер между проверками
+S3KeySensor(
+    task_id="wait_for_file",
+    bucket_key="data/{{ ds }}/input.csv",
+    mode="reschedule",
+    poke_interval=300,
+    timeout=7200,
+)
+
+# ЛУЧШЕ ВСЕГО: deferrable=True (Airflow 2.2+, нужен triggerer) —
+# задача передаётся triggerer'у, worker-слот освобождается полностью
+S3KeySensor(
+    task_id="wait_for_file",
+    bucket_key="data/{{ ds }}/input.csv",
+    deferrable=True,
+)
+```
+
+**Когда `mode='poke'` уместен:** только для очень коротких ожиданий (секунды/единицы минут), где накладные расходы на reschedule/deferral не окупаются.
+
+---
+
+## 12. Устаревшие паттерны
+
+**SubDagOperator** — anti-pattern с Airflow 2.0: сабдаг сам занимает worker-слот, ожидая слоты для своих внутренних задач, что может привести к deadlock планировщика при небольшом пуле воркеров.
+```python
+# BAD
+from airflow.operators.subdag import SubDagOperator
+
+# GOOD — используй TaskGroup
+from airflow.decorators import task_group
+
+@task_group
+def my_group():
+    ...
+```
+
+**`execution_date` в контексте** — deprecated с Airflow 2.2. Для DAG с нестандартным расписанием (data-driven, кастомные timetables) это поле теряет однозначный смысл.
+```python
+# BAD
+@task
+def process(**context):
+    execution_date = context["execution_date"]
+
+# GOOD
+@task
+def process(**context):
+    logical_date = context["logical_date"]
+    start = context["data_interval_start"]
+```
+
+**Прямой доступ к metadata DB** — обращение к `DagModel`/`TaskInstance`/`DagRun` через `airflow.settings.Session` не является публичным API: схема меняется между минорными версиями Airflow, а лишние соединения нагружают БД метаданных, от которой зависит весь scheduler.
+```python
+# BAD
+from airflow.settings import Session
+session = Session()
+session.query(TaskInstance).filter(...)
+
+# GOOD — используй Airflow REST API или CLI
+# GET /api/v1/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances
+```
+
+---
+
+## 13. Мониторинг и алерты
 
 **Callback-паттерн (рекомендуется):**
 ```python
@@ -289,3 +368,47 @@ DAG(
     default_args={"sla": timedelta(hours=2)},
 )
 ```
+
+---
+
+## 14. Группировка тасков и зависимостей
+
+**Что это:** создание тасков/операторов и объявление зависимостей (`>>`, `set_downstream`, TaskFlow-вызовы, `.expand`/`.partial`) собраны в одном месте — как правило, одним блоком в конце DAG, после вспомогательных функций и конфигурации.
+
+**Почему важно:** DAG — это в первую очередь граф. Когда инстанцирование тасков перемежается с другим кодом (helper-функциями, условиями, конфигурацией), граф перестаёт читаться целиком — приходится листать файл вверх-вниз, чтобы понять реальный порядок выполнения.
+
+**Антипаттерн:**
+```python
+# BAD: таски и зависимости разбросаны по файлу
+with DAG("etl", ...) as dag:
+    extract_task = PythonOperator(task_id="extract", python_callable=extract)
+
+    THRESHOLD = 100  # конфигурация затесалась между тасками
+
+    def _validate(**context):
+        ...
+
+    validate_task = PythonOperator(task_id="validate", python_callable=_validate)
+    extract_task >> validate_task  # зависимость объявлена не в конце, а сразу здесь
+
+    load_task = PythonOperator(task_id="load", python_callable=load)
+    validate_task >> load_task
+```
+
+**Хороший паттерн:**
+```python
+# GOOD: сначала вся конфигурация и функции, потом — единый блок тасков и зависимостей
+with DAG("etl", ...) as dag:
+    THRESHOLD = 100
+
+    def _validate(**context):
+        ...
+
+    extract_task = PythonOperator(task_id="extract", python_callable=extract)
+    validate_task = PythonOperator(task_id="validate", python_callable=_validate)
+    load_task = PythonOperator(task_id="load", python_callable=load)
+
+    extract_task >> validate_task >> load_task
+```
+
+Это же правило действует и для TaskFlow API — вызовы `extract()`, `transform()`, `load()` и их цепочка должны идти одним блоком в конце функции DAG.

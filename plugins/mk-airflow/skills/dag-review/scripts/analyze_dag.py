@@ -5,7 +5,7 @@ Outputs JSON for consumption by the Claude skill.
 
 Usage:
     python3 analyze_dag.py --path /path/to/dag.py
-    python3 analyze_dag.py --path /path/to/dag.py --json   # pretty-print
+    python3 analyze_dag.py --path /path/to/dag.py --pretty   # pretty-print
 """
 
 import ast
@@ -42,10 +42,6 @@ class Issue:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DAGAnalyzer:
-    SCORE_PENALTIES = {
-        # (severity, category fragment) → penalty
-    }
-
     def __init__(self, code: str):
         self.code = code
         self.issues: list[Issue] = []
@@ -76,6 +72,11 @@ class DAGAnalyzer:
             self._check_dependency_style()
             self._check_logging()
             self._check_on_failure_callback()
+            self._check_sensors()
+            self._check_subdag()
+            self._check_execution_date()
+            self._check_metadata_db_access()
+            self._check_task_grouping()
 
         score = max(0, min(100, self.score))
         if score >= 85:
@@ -165,6 +166,91 @@ class DAGAnalyzer:
                         stub = ast.Call(func=dec, args=[], keywords=[])
                         self.dag_calls.append(stub)
         self.dag_found = bool(self.dag_calls)
+
+    # ── Группировка тасков ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _callable_name(node) -> str:
+        """Имя вызываемого объекта для Call/декоратора: Attribute.attr или Name.id."""
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        if isinstance(node, ast.Name):
+            return node.id
+        return ""
+
+    def _dag_body_blocks(self) -> list:
+        """Тела `with DAG(...) as dag:` и функций, декорированных `@dag`."""
+        blocks = []
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.With):
+                for item in node.items:
+                    call = item.context_expr
+                    if isinstance(call, ast.Call) and self._callable_name(call.func) == "DAG":
+                        blocks.append(node.body)
+            elif isinstance(node, ast.FunctionDef):
+                for dec in node.decorator_list:
+                    dec_call = dec.func if isinstance(dec, ast.Call) else dec
+                    if self._callable_name(dec_call) == "dag":
+                        blocks.append(node.body)
+        return blocks
+
+    def _taskflow_function_names(self) -> set:
+        """Имена функций, декорированных `@task` (включая `@task(...)`)."""
+        names = set()
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for dec in node.decorator_list:
+                dec_call = dec.func if isinstance(dec, ast.Call) else dec
+                if self._callable_name(dec_call) == "task":
+                    names.add(node.name)
+        return names
+
+    def _is_task_related_stmt(self, stmt, taskflow_names: set) -> bool:
+        """Инстанцирование оператора/сенсора, TaskFlow-вызов или связывание зависимостей."""
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.BinOp) \
+                and isinstance(stmt.value.op, (ast.RShift, ast.LShift)):
+            return True  # a >> b / a << b
+
+        call = None
+        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+            call = stmt.value
+        elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            call = stmt.value
+        if call is None:
+            return False
+
+        name = self._callable_name(call.func)
+        if name.endswith("Operator") or name.endswith("Sensor"):
+            return True
+        if name in ("set_downstream", "set_upstream", "expand", "partial"):
+            return True
+        return any(isinstance(n, ast.Name) and n.id in taskflow_names for n in ast.walk(call))
+
+    def _check_task_grouping(self):
+        taskflow_names = self._taskflow_function_names()
+        for body in self._dag_body_blocks():
+            related_idx = [
+                i for i, stmt in enumerate(body)
+                if self._is_task_related_stmt(stmt, taskflow_names)
+            ]
+            if len(related_idx) < 2:
+                continue
+            first, last = related_idx[0], related_idx[-1]
+            related_set = set(related_idx)
+            if any(i not in related_set for i in range(first, last + 1)):
+                self._add(
+                    "warning", "Читаемость",
+                    "Вызовы тасков/операторов разбросаны по DAG",
+                    "Создание тасков и связывание зависимостей (`>>`, `set_downstream`, "
+                    "TaskFlow-вызовы, `.expand`/`.partial`) перемежаются с другим кодом внутри "
+                    "DAG-блока. Из-за этого сложно охватить взглядом весь граф выполнения — "
+                    "приходится листать файл вверх-вниз, чтобы понять порядок задач.",
+                    "Собери создание тасков и объявление зависимостей в одном месте — "
+                    "как правило, внизу DAG-блока, после вспомогательных функций и конфигурации.",
+                    penalty=6,
+                )
+                break
 
     def _check_top_level_code(self):
         patterns = [
@@ -510,6 +596,89 @@ class DAGAnalyzer:
                 "Настроен `on_failure_callback`",
                 "Отлично! Callback при сбое — правильный способ оповещений "
                 "(гибче чем email_on_failure).",
+            )
+
+    def _check_sensors(self):
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = ""
+            if isinstance(node.func, ast.Attribute):
+                name = node.func.attr
+            elif isinstance(node.func, ast.Name):
+                name = node.func.id
+            if not name.endswith("Sensor"):
+                continue
+
+            deferrable = False
+            mode_reschedule = False
+            for kw in node.keywords:
+                if kw.arg == "deferrable" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                    deferrable = True
+                if kw.arg == "mode" and isinstance(kw.value, ast.Constant) and kw.value.value == "reschedule":
+                    mode_reschedule = True
+
+            if deferrable:
+                self._add(
+                    "ok", "Производительность",
+                    f"`{name}` использует `deferrable=True`",
+                    "Deferrable-режим освобождает worker-слот на время ожидания "
+                    "(задача передаётся triggerer'у) — самый эффективный вариант для сенсоров.",
+                )
+            elif not mode_reschedule:
+                self._add(
+                    "warning", "Производительность",
+                    f"`{name}` без `deferrable=True` или `mode='reschedule'`",
+                    "По умолчанию `mode='poke'` держит worker-слот занятым на всё время ожидания. "
+                    "При долгих ожиданиях (минуты/часы) это забивает пул воркеров впустую.",
+                    "Добавь `deferrable=True` (Airflow 2.2+, требует triggerer) "
+                    "или как минимум `mode='reschedule'`.",
+                    penalty=8,
+                )
+
+    def _check_subdag(self):
+        if "SubDagOperator" in self.code or "airflow.operators.subdag" in self.code:
+            self._add(
+                "warning", "Совместимость",
+                "Используется устаревший `SubDagOperator`",
+                "SubDAG считается anti-pattern начиная с Airflow 2.0: провоцирует deadlock "
+                "планировщика (сабдаг сам занимает worker-слот, ожидая слоты для своих задач) "
+                "и плохо масштабируется.",
+                "Замени на TaskGroup: `from airflow.decorators import task_group` "
+                "(или `from airflow.utils.task_group import TaskGroup` для классического API).",
+                penalty=10,
+            )
+
+    def _check_execution_date(self):
+        if re.search(r'\bexecution_date\b', self.code):
+            self._add(
+                "info", "Совместимость",
+                "Используется устаревший контекст `execution_date`",
+                "С Airflow 2.2 `execution_date` считается deprecated: для DAG с не-cron "
+                "расписанием (data-driven триггеры, кастомные timetables) это поле "
+                "теряет однозначный смысл.",
+                "Замени на `logical_date` (прямой аналог) или на `data_interval_start`/"
+                "`data_interval_end`, если нужна именно граница интервала.",
+                penalty=3,
+            )
+
+    def _check_metadata_db_access(self):
+        patterns = [
+            r'from\s+airflow\.settings\s+import\s+Session\b',
+            r'from\s+airflow\.models\s+import[^\n]*\b(?:DagModel|TaskInstance|DagRun)\b',
+            r'\bcreate_session\s*\(',
+        ]
+        if any(re.search(p, self.code) for p in patterns):
+            self._add(
+                "warning", "Совместимость",
+                "Прямой доступ к metadata DB Airflow",
+                "Прямые запросы к внутренним таблицам (`DagModel`, `TaskInstance`, `DagRun`) "
+                "через ORM-сессию Airflow — не публичный API: схема меняется между минорными "
+                "версиями, а лишние соединения нагружают БД метаданных, от которой зависит "
+                "весь scheduler.",
+                "Используй Airflow REST API (`/api/v1/...`) или CLI вместо прямых запросов "
+                "к metadata DB.",
+                penalty=10,
             )
 
 

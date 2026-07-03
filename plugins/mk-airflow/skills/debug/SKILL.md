@@ -23,17 +23,19 @@ description: >
 # Установка (не требует install, работает через uvx)
 uvx --from astro-airflow-mcp af --help
 
-# Настройка инстанса (один раз)
+# Настройка инстанса (один раз) — пароль через переменную окружения,
+# а не CLI-флагом: аргументы командной строки попадают в историю шелла и в `ps`
+export AIRFLOW_PASSWORD=<password>
 uvx --from astro-airflow-mcp af instance add prod \
   --url https://<your-airflow-url> \
-  --username <user> --password <password>
+  --username <user>
 
 # Проверить текущий инстанс
 uvx --from astro-airflow-mcp af instance list
 ```
 
 > Конфигурация сохраняется в `~/.af/config.yaml`.
-> Альтернатива — переменные окружения: `AIRFLOW_API_URL`, `AIRFLOW_USERNAME`, `AIRFLOW_PASSWORD`.
+> Альтернатива — переменные окружения целиком: `AIRFLOW_API_URL`, `AIRFLOW_USERNAME`, `AIRFLOW_PASSWORD`.
 
 ### 2. MCP для S3 (Yandex S3 / AWS S3)
 
@@ -302,5 +304,5 @@ WARN NodeStatusUpdater: Disks are bad: /hadoop/yarn/nm-local-dir
 [ ] 5. Если "status 1" → взять yarn_app_id из driveroutput ("Submitted application application_XXXX")
 [ ] 6. s3_list_objects → yarn-logs/dataproc-agent/bucket-logs-tfile/0001/application_{yarn_app_id}/ (пробовать 0001, 0002, … пока не найдёт файл)
 [ ] 7. grep "Traceback" или "Exception" в YARN TFile (файл бинарный, is_base64=True — декодировать перед поиском)
-[ ] 7. Определить тип ошибки → применить fix из раздела выше
+[ ] 8. Определить тип ошибки → применить fix из раздела выше
 ```
