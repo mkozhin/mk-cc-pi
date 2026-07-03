@@ -1,0 +1,9 @@
+{
+  "name": "mk-cc-pi",
+  "private": true,
+  "description": "Коллекция скиллов для Claude Code и Pi: дата-инженерия, DevOps и общего назначения",
+  "keywords": ["pi-package"],
+  "pi": {
+    "skills": ["./plugins/mk-airflow/skills"]
+  }
+}

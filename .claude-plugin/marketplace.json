@@ -1,0 +1,19 @@
+{
+  "name": "mk-cc-pi",
+  "owner": {
+    "name": "mkozhin"
+  },
+  "description": "Коллекция скиллов для Claude Code и Pi: дата-инженерия, DevOps и общего назначения",
+  "plugins": [
+    {
+      "name": "mk-airflow",
+      "source": "./plugins/mk-airflow",
+      "description": "Скиллы для работы с Airflow: диагностика падений задач, ревью DAG и т.д.",
+      "author": {
+        "name": "mkozhin"
+      },
+      "category": "data-engineering",
+      "keywords": ["airflow", "data-engineering", "dag", "debugging"]
+    }
+  ]
+}

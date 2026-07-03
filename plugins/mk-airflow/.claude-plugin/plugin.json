@@ -1,0 +1,7 @@
+{
+  "name": "mk-airflow",
+  "description": "Скиллы для работы с Airflow: диагностика падений задач, ревью DAG и т.д.",
+  "author": {
+    "name": "mkozhin"
+  }
+}
