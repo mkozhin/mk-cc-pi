@@ -15,7 +15,27 @@ description: >
 
 ## Необходимые инструменты
 
-### 1. Airflow CLI (`astro-airflow-mcp`)
+### 0. Сначала проверь — не подключён ли уже Airflow MCP
+
+`astro-airflow-mcp` (тот же пакет, что и CLI `af` ниже) умеет работать и как MCP-сервер. Если пользователь уже подключил его в Claude Code, там уже прописаны `AIRFLOW_API_URL`/`AIRFLOW_USERNAME`/`AIRFLOW_PASSWORD` — не нужно ничего настраивать заново, и вызов инструмента будет быстрее, чем поднимать CLI. Поэтому прежде чем лезть в установку CLI, проверь MCP:
+
+- Посмотри в списке доступных тебе инструментов (в т.ч. среди deferred/MCP-инструментов) имена вида `mcp__airflow__...`, `mcp__astro-airflow__...` или похожие — имя сервера пользователь мог задать произвольно.
+- Либо спроси в терминале: `claude mcp list` — покажет настроенные MCP-серверы (без секретов в выводе).
+
+Если такой MCP найден — используй его инструменты напрямую вместо `af` CLI из шага 1 (проверь их описания/схемы перед вызовом, конкретные имена и параметры зависят от версии сервера). К шагам 2+ (S3/Dataproc/YARN) это не относится — они не зависят от того, как получены Airflow-логи.
+
+Если MCP не найден, переходи к CLI ниже. Заодно можно предложить пользователю подключить MCP на будущее — так следующий дебаг обойдётся вообще без ручной настройки:
+
+```bash
+claude mcp add airflow -s user \
+  -e AIRFLOW_API_URL=https://<airflow-url> \
+  -e AIRFLOW_USERNAME=<user> \
+  -e AIRFLOW_PASSWORD='<password>' \
+  -e AF_READ_ONLY=true \
+  -- uvx astro-airflow-mcp --transport stdio
+```
+
+### 1. Airflow CLI (`astro-airflow-mcp`) — если MCP не подключён
 
 Используется для чтения логов задач и информации о runs прямо из Airflow.
 
@@ -75,6 +95,8 @@ uvx --from astro-airflow-mcp af instance list
 ---
 
 ## Шаг 1 — Получить логи задачи из Airflow
+
+Если найден подключённый Airflow MCP (см. шаг 0) — вызови его инструмент получения логов задачи напрямую. Если нет — используй CLI:
 
 ```bash
 uvx --from astro-airflow-mcp af tasks logs \
@@ -297,7 +319,8 @@ WARN NodeStatusUpdater: Disks are bad: /hadoop/yarn/nm-local-dir
 ## Быстрый чеклист при любом падении
 
 ```
-[ ] 1. af tasks logs <dag> <run_id> <task_id>
+[ ] 0. Есть ли уже подключённый Airflow MCP? Если да — использовать его вместо af CLI
+[ ] 1. af tasks logs <dag> <run_id> <task_id> (или эквивалент через MCP)
 [ ] 2. Найти cluster_id и job_id в логах (для Dataproc)
 [ ] 3. s3_list_objects → dataproc/clusters/<cluster_id>/jobs/<job_id>/
 [ ] 4. Прочитать последние 2-3 driveroutput файла
